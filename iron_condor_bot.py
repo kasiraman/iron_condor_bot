@@ -66,11 +66,22 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 UNDERLYING = os.getenv("UNDERLYING", "SPY")
 EM_MULTIPLIER = float(os.getenv("EM_MULTIPLIER", "1.25"))      # short strike = spot +/- EM_MULTIPLIER * EM
 WING_FRACTION = float(os.getenv("WING_FRACTION", "0.5"))       # long strike = short +/- WING_FRACTION * EM
-QTY = int(os.getenv("QTY", "1"))  # ceiling on contracts/leg -- actual qty is sized down to fit MAX_RISK_PER_TRADE_USD
+QTY = int(os.getenv("QTY", "1"))  # ceiling on contracts/leg -- actual qty is sized down to fit the risk budget below
 RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.05"))
 STRIKE_RANGE_PCT = float(os.getenv("STRIKE_RANGE_PCT", "0.08"))  # how wide a strike window to pull from the chain
-MAX_RISK_PER_TRADE_USD = float(os.getenv("MAX_RISK_PER_TRADE_USD", "500"))  # qty = floor(this / risk-per-contract), capped at QTY
 CREDIT_BUFFER = float(os.getenv("CREDIT_BUFFER", "0.05"))        # shave this off mid-credit to help the limit order fill
+
+# Per-trade risk budget: dollars, percent of account equity, or both. qty is sized to
+# floor(risk_budget / risk_per_contract), capped at QTY. If both are set, the dollar
+# amount acts as a hard ceiling on whatever the percentage of equity would otherwise
+# allow -- e.g. "risk 2% of the account, but never more than $1,000 even as equity grows".
+# If neither is set, falls back to a flat $500 (the original default).
+_max_risk_usd_env = os.getenv("MAX_RISK_PER_TRADE_USD")
+_max_risk_pct_env = os.getenv("MAX_RISK_PER_TRADE_PCT")
+MAX_RISK_PER_TRADE_USD = float(_max_risk_usd_env) if _max_risk_usd_env else None
+MAX_RISK_PER_TRADE_PCT = float(_max_risk_pct_env) if _max_risk_pct_env else None  # fraction, e.g. 0.02 = 2%
+if MAX_RISK_PER_TRADE_USD is None and MAX_RISK_PER_TRADE_PCT is None:
+    MAX_RISK_PER_TRADE_USD = 500.0
 LOG_DIR = Path(__file__).parent / "logs"
 TRADE_LOG_CSV = LOG_DIR / "trades.csv"
 
@@ -130,6 +141,31 @@ def get_clients():
 def market_is_open_today(trade_client) -> bool:
     clock = trade_client.get_clock()
     return clock.is_open
+
+
+def compute_risk_budget(trade_client) -> float:
+    """Resolves the per-trade dollar risk budget from MAX_RISK_PER_TRADE_USD /
+    MAX_RISK_PER_TRADE_PCT. Only calls Alpaca for account equity if a percent-based
+    budget is actually configured -- no extra API call otherwise. If both a dollar
+    and a percent budget are configured, returns whichever is LOWER, so the dollar
+    figure acts as a hard ceiling on the percent-of-equity figure."""
+    pct_budget = None
+    if MAX_RISK_PER_TRADE_PCT is not None:
+        account = trade_client.get_account()
+        equity = float(account.equity)
+        pct_budget = equity * MAX_RISK_PER_TRADE_PCT
+        log.info(f"Account equity: ${equity:,.2f} -> MAX_RISK_PER_TRADE_PCT ({MAX_RISK_PER_TRADE_PCT:.2%}) budget = ${pct_budget:,.2f}")
+
+    if MAX_RISK_PER_TRADE_USD is not None and pct_budget is not None:
+        budget = min(MAX_RISK_PER_TRADE_USD, pct_budget)
+        log.info(
+            f"Both a dollar (${MAX_RISK_PER_TRADE_USD:,.2f}) and percent-of-equity (${pct_budget:,.2f}) "
+            f"risk budget are configured -- using the lower of the two: ${budget:,.2f}"
+        )
+        return budget
+    if MAX_RISK_PER_TRADE_USD is not None:
+        return MAX_RISK_PER_TRADE_USD
+    return pct_budget
 
 
 def get_spot_price(stock_data_client, symbol):
@@ -338,12 +374,13 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
     # Size the position to use as much of the risk budget as the strikes/credit allow,
     # capped at QTY (now a ceiling, not a fixed size) -- rather than trading a fixed QTY
     # and simply refusing to trade at all whenever that fixed size happens to exceed budget.
-    max_affordable_qty = math.floor(MAX_RISK_PER_TRADE_USD / risk_per_contract)
+    risk_budget = compute_risk_budget(trade_client)
+    max_affordable_qty = math.floor(risk_budget / risk_per_contract)
     if max_affordable_qty < 1:
         raise RuntimeError(
-            f"Even 1 contract's risk (${risk_per_contract:.2f}) exceeds MAX_RISK_PER_TRADE_USD "
-            f"(${MAX_RISK_PER_TRADE_USD:.2f}) -- aborting. Raise MAX_RISK_PER_TRADE_USD, or check "
-            "whether EM_MULTIPLIER/WING_FRACTION are producing wider wings than intended."
+            f"Even 1 contract's risk (${risk_per_contract:.2f}) exceeds the risk budget "
+            f"(${risk_budget:.2f}) -- aborting. Raise MAX_RISK_PER_TRADE_USD/MAX_RISK_PER_TRADE_PCT, or "
+            "check whether EM_MULTIPLIER/WING_FRACTION are producing wider wings than intended."
         )
 
     qty = min(QTY, max_affordable_qty)
@@ -351,7 +388,7 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
 
     log.info(
         f"Net credit (mid): {net_credit:.2f}/contract | Risk/contract: ${risk_per_contract:.2f} | "
-        f"Max affordable qty: {max_affordable_qty} (budget ${MAX_RISK_PER_TRADE_USD:.2f}) | QTY cap: {QTY} | "
+        f"Max affordable qty: {max_affordable_qty} (budget ${risk_budget:.2f}) | QTY cap: {QTY} | "
         f"Using qty={qty} | Max risk: ${max_risk:.2f}"
     )
 
@@ -365,6 +402,7 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
         "long_call": long_call,
         "net_credit": net_credit,
         "max_risk": max_risk,
+        "risk_budget": risk_budget,
         "qty": qty,
     }
 
