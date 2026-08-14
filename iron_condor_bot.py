@@ -36,6 +36,7 @@ from scipy.optimize import brentq
 from scipy.stats import norm
 
 from bot_logging import get_logger
+from alpaca_config import ALPACA_PAPER, API_KEY, SECRET_KEY
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -60,8 +61,8 @@ from alpaca.data.enums import DataFeed, OptionsFeed
 # --------------------------------------------------------------------------
 load_dotenv()
 
-API_KEY = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+# API_KEY / SECRET_KEY / ALPACA_PAPER come from alpaca_config.py (shared with the other
+# scripts) -- see ALPACA_PAPER in .env to control paper vs. live trading.
 
 UNDERLYING = os.getenv("UNDERLYING", "SPY")
 EM_MULTIPLIER = float(os.getenv("EM_MULTIPLIER", "1.25"))      # short strike = spot +/- EM_MULTIPLIER * EM
@@ -131,8 +132,15 @@ def year_fraction_to_close(now: datetime) -> float:
 # --------------------------------------------------------------------------
 def get_clients():
     if not API_KEY or not SECRET_KEY:
-        raise RuntimeError("ALPACA_API_KEY / ALPACA_SECRET_KEY not set (check your .env file).")
-    trade_client = TradingClient(api_key=API_KEY, secret_key=SECRET_KEY, paper=True)
+        raise RuntimeError(
+            "Alpaca API key/secret not set for the active mode (check ALPACA_PAPER and the "
+            "matching ALPACA_PAPER_*/ALPACA_LIVE_*/ALPACA_API_KEY/ALPACA_SECRET_KEY vars in .env)."
+        )
+    if ALPACA_PAPER:
+        log.info("Mode: PAPER trading (ALPACA_PAPER=true).")
+    else:
+        log.warning("!!! LIVE TRADING MODE (ALPACA_PAPER=false) -- real money, real orders !!!")
+    trade_client = TradingClient(api_key=API_KEY, secret_key=SECRET_KEY, paper=ALPACA_PAPER)
     option_data_client = OptionHistoricalDataClient(api_key=API_KEY, secret_key=SECRET_KEY)
     stock_data_client = StockHistoricalDataClient(api_key=API_KEY, secret_key=SECRET_KEY)
     return trade_client, option_data_client, stock_data_client

@@ -1,4 +1,4 @@
-# SPY 0DTE Iron Condor Bot (Alpaca Paper Trading)
+# SPY 0DTE Iron Condor Bot (Alpaca Paper/Live Trading)
 
 Sells a same-day-expiration iron condor on SPY at market open, sized off an
 Expected Move (EM) calculated from the IV formula:
@@ -26,13 +26,13 @@ you'd just swap `UNDERLYING` and update contract-symbol assumptions.
 - **No exit management on its own.** `iron_condor_bot.py` only opens the position — see
   `monitor_and_exit.py` below for the companion script that watches it and closes early
   on a profit target or stop loss.
-- **Not yet run against a live account.** This was written and syntax-checked, but not
-  executed against Alpaca's API (no credentials available while building it). Test it
-  thoroughly yourself before trusting it to run unattended:
+- **Defaults to paper trading.** Test thoroughly before ever flipping to live (see
+  "Going live" below):
   1. Run with `--dry-run` repeatedly first and sanity-check the strikes/credit it computes.
   2. Run for real in paper trading, small qty, and manually confirm fills/positions in the
      Alpaca dashboard.
   3. Only then consider scheduling it to run unattended.
+  4. Only after that has run unattended for a while and you trust it, consider `ALPACA_PAPER=false`.
 
 ## Setup
 
@@ -44,6 +44,45 @@ pip install -r requirements.txt
 cp .env.example .env
 # edit .env and paste your Alpaca PAPER API key + secret (Alpaca dashboard -> Paper Trading -> API Keys)
 ```
+
+## Going live
+
+All three trading scripts (`iron_condor_bot.py`, `monitor_and_exit.py`, `settle_trades.py`)
+resolve their Alpaca credentials and paper/live mode through a shared `alpaca_config.py`,
+controlled by one setting in `.env`:
+
+```
+ALPACA_PAPER=true   # default -- unset, or anything other than an explicit false-like
+                     # value ("false", "0", "no", "off", "live"), stays in paper mode
+```
+
+To go live:
+
+1. In your Alpaca dashboard, apply for options trading approval on the **live** account
+   (Home page → "apply for options trading", next to "Add Funds") -- this is separate
+   from paper trading, which gets full option-strategy access automatically. Per FINRA
+   Rule 2360, every account needs this approval before its first live options trade.
+2. Generate a new API key pair from the **live** account (Home/Account → API Keys) --
+   paper and live keys are entirely separate credentials.
+3. Fund the live account with at least enough buying power to cover your configured
+   risk budget (`MAX_RISK_PER_TRADE_USD` / `MAX_RISK_PER_TRADE_PCT` x `QTY`).
+4. In `.env`, either swap `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` to the new live keys, or
+   (safer, lets you flip back and forth without re-editing keys) set
+   `ALPACA_PAPER_API_KEY`/`ALPACA_PAPER_SECRET_KEY` to your paper keys and
+   `ALPACA_LIVE_API_KEY`/`ALPACA_LIVE_SECRET_KEY` to your live keys -- these take
+   priority over the plain `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` for whichever mode is active.
+5. Set `ALPACA_PAPER=false`.
+6. Before trusting it unattended, run each script manually once (e.g.
+   `python3 iron_condor_bot.py --dry-run --force`) and check the console/log output opens
+   with `Mode: PAPER trading` or the loud `!!! LIVE TRADING MODE !!!` warning as expected
+   -- confirm it says what you think it should say before letting cron touch real money.
+7. Strongly consider sizing down from whatever you were running in paper while you confirm
+   live fills/behavior match what paper showed you (`QTY`, `MAX_RISK_PER_TRADE_USD`, or
+   `MAX_RISK_PER_TRADE_PCT` -- see "Config knobs" below). Paper fills are simulated and
+   don't necessarily reflect real slippage/liquidity on multi-leg combo orders.
+
+To go back to paper, just set `ALPACA_PAPER=true` again (or remove the line, since that's
+the default).
 
 ## Full daily schedule (all steps, end to end)
 
