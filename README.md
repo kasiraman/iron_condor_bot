@@ -176,10 +176,10 @@ reporting; the `.log` files are the human-readable run history/diagnostics.
 | `UNDERLYING` | `SPY` | Symbol traded |
 | `EM_MULTIPLIER` | `1.25` | Short strike distance = this * EM |
 | `WING_FRACTION` | `0.5` | Long strike (wing) = short strike +/- this * EM |
-| `QTY` | `1` | Contracts per leg |
+| `QTY` | `1` | **Ceiling** on contracts/leg -- the actual qty submitted is sized down to fit the risk budget (see `MAX_RISK_PER_TRADE_USD`), never trading more than this even if the budget would allow it |
 | `RISK_FREE_RATE` | `0.05` | Used in the Black-Scholes IV solve |
 | `STRIKE_RANGE_PCT` | `0.08` | How wide a strike window to pull from the chain around spot |
-| `MAX_RISK_PER_TRADE_USD` | `500` | Bot aborts instead of submitting if max loss exceeds this |
+| `MAX_RISK_PER_TRADE_USD` | `500` | Risk budget the position is sized to: `qty = floor(MAX_RISK_PER_TRADE_USD / risk_per_contract)`, capped at `QTY`. Aborts instead of submitting if even 1 contract's risk exceeds this |
 | `CREDIT_BUFFER` | `0.05` | Shaved off the mid-price credit so the limit order is more likely to fill |
 
 ## Logging trade performance (for the 3-month paper run)

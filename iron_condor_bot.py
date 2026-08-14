@@ -66,10 +66,10 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 UNDERLYING = os.getenv("UNDERLYING", "SPY")
 EM_MULTIPLIER = float(os.getenv("EM_MULTIPLIER", "1.25"))      # short strike = spot +/- EM_MULTIPLIER * EM
 WING_FRACTION = float(os.getenv("WING_FRACTION", "0.5"))       # long strike = short +/- WING_FRACTION * EM
-QTY = int(os.getenv("QTY", "1"))
+QTY = int(os.getenv("QTY", "1"))  # ceiling on contracts/leg -- actual qty is sized down to fit MAX_RISK_PER_TRADE_USD
 RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.05"))
 STRIKE_RANGE_PCT = float(os.getenv("STRIKE_RANGE_PCT", "0.08"))  # how wide a strike window to pull from the chain
-MAX_RISK_PER_TRADE_USD = float(os.getenv("MAX_RISK_PER_TRADE_USD", "500"))
+MAX_RISK_PER_TRADE_USD = float(os.getenv("MAX_RISK_PER_TRADE_USD", "500"))  # qty = floor(this / risk-per-contract), capped at QTY
 CREDIT_BUFFER = float(os.getenv("CREDIT_BUFFER", "0.05"))        # shave this off mid-credit to help the limit order fill
 LOG_DIR = Path(__file__).parent / "logs"
 TRADE_LOG_CSV = LOG_DIR / "trades.csv"
@@ -320,19 +320,40 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
             - float(leg_quotes[long_call.symbol].ask_price)
         )
 
+    if net_credit <= 0:
+        raise RuntimeError(f"Computed net credit is non-positive ({net_credit:.2f}) -- aborting, check quotes.")
+
     put_wing_width = float(short_put.strike_price) - float(long_put.strike_price)
     call_wing_width = float(long_call.strike_price) - float(short_call.strike_price)
     max_wing_width = max(put_wing_width, call_wing_width)
-    max_risk = (max_wing_width - net_credit) * 100 * QTY
+    risk_per_contract = (max_wing_width - net_credit) * 100
 
-    log.info(f"Net credit (mid): {net_credit:.2f}/contract | Max risk: ${max_risk:.2f} for qty={QTY}")
-
-    if net_credit <= 0:
-        raise RuntimeError(f"Computed net credit is non-positive ({net_credit:.2f}) -- aborting, check quotes.")
-    if max_risk > MAX_RISK_PER_TRADE_USD:
+    if risk_per_contract <= 0:
         raise RuntimeError(
-            f"Max risk ${max_risk:.2f} exceeds MAX_RISK_PER_TRADE_USD (${MAX_RISK_PER_TRADE_USD:.2f}) -- aborting."
+            f"Computed risk per contract is non-positive (${risk_per_contract:.2f}) -- net credit "
+            f"(${net_credit:.2f}/contract) exceeds the max wing width (${max_wing_width:.2f}), which "
+            "shouldn't happen for a real iron condor. Check quotes/strikes before trusting this."
         )
+
+    # Size the position to use as much of the risk budget as the strikes/credit allow,
+    # capped at QTY (now a ceiling, not a fixed size) -- rather than trading a fixed QTY
+    # and simply refusing to trade at all whenever that fixed size happens to exceed budget.
+    max_affordable_qty = math.floor(MAX_RISK_PER_TRADE_USD / risk_per_contract)
+    if max_affordable_qty < 1:
+        raise RuntimeError(
+            f"Even 1 contract's risk (${risk_per_contract:.2f}) exceeds MAX_RISK_PER_TRADE_USD "
+            f"(${MAX_RISK_PER_TRADE_USD:.2f}) -- aborting. Raise MAX_RISK_PER_TRADE_USD, or check "
+            "whether EM_MULTIPLIER/WING_FRACTION are producing wider wings than intended."
+        )
+
+    qty = min(QTY, max_affordable_qty)
+    max_risk = risk_per_contract * qty
+
+    log.info(
+        f"Net credit (mid): {net_credit:.2f}/contract | Risk/contract: ${risk_per_contract:.2f} | "
+        f"Max affordable qty: {max_affordable_qty} (budget ${MAX_RISK_PER_TRADE_USD:.2f}) | QTY cap: {QTY} | "
+        f"Using qty={qty} | Max risk: ${max_risk:.2f}"
+    )
 
     return {
         "spot": spot,
@@ -344,6 +365,7 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
         "long_call": long_call,
         "net_credit": net_credit,
         "max_risk": max_risk,
+        "qty": qty,
     }
 
 
@@ -357,14 +379,14 @@ def submit_iron_condor(trade_client, plan):
     limit_price = round(max(plan["net_credit"] - CREDIT_BUFFER, 0.01), 2)
 
     req = LimitOrderRequest(
-        qty=QTY,
+        qty=plan["qty"],
         order_class=OrderClass.MLEG,
         time_in_force=TimeInForce.DAY,
         limit_price=limit_price,
         legs=legs,
     )
     order = trade_client.submit_order(req)
-    log.info(f"Submitted iron condor order id={order.id} limit_price={limit_price}")
+    log.info(f"Submitted iron condor order id={order.id} qty={plan['qty']} limit_price={limit_price}")
     return order
 
 
@@ -393,7 +415,7 @@ def log_trade(plan, order=None, dry_run=False):
             plan["long_put"].symbol, plan["long_put"].strike_price,
             plan["short_call"].symbol, plan["short_call"].strike_price,
             plan["long_call"].symbol, plan["long_call"].strike_price,
-            f"{plan['net_credit']:.2f}", f"{plan['max_risk']:.2f}", QTY,
+            f"{plan['net_credit']:.2f}", f"{plan['max_risk']:.2f}", plan["qty"],
             getattr(order, "id", ""), dry_run,
         ])
 
