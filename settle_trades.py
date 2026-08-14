@@ -182,6 +182,18 @@ def get_fees_for_date(trade_client, date_str, symbols):
     endpoint (GET /v2/account/activities) but alpaca-py doesn't wrap it with a named
     method in the installed version, so it's called directly via trade_client.get().
 
+    IMPORTANT: FEE activity is summed for the WHOLE DATE, not filtered by symbol. Real
+    regulatory/exchange pass-through fees (OCC Clearing, CAT, OPT TAF, ORF, OPT REG,
+    etc.) are frequently reported at the account/day level rather than tagged with any
+    single option symbol -- e.g. "CAT fee for proceed of 8 trades on <date>" or "ORF fee
+    for proceed of 80 contracts", which span every trade/contract that day, not one
+    symbol. An earlier version of this function filtered FEE activity by symbol along
+    with everything else, which silently excluded almost all of these (since they carry
+    no matching symbol), making every trade look fee-free even when Alpaca was actually
+    charging $3+/day in real regulatory fees. settle_row() below divides this date-level
+    total across however many trades were logged on the same date, so it isn't
+    double-counted if more than one trade happened that day.
+
     Only activity_type == "FEE" is summed into `fee_total` -- that's unambiguously a fee,
     not a trade or a settlement event. Other symbol-matching activity on this date (e.g.
     OPASN/OPEXC for assignment/exercise, which happens because SPY is physically settled)
@@ -202,14 +214,16 @@ def get_fees_for_date(trade_client, date_str, symbols):
     other_activity = []
     fills = []
     for a in activities:
-        sym = a.get("symbol")
-        if sym not in symbol_set:
-            continue
         atype = a.get("activity_type")
         net = a.get("net_amount")
         if atype == "FEE" and net is not None:
             fee_total += float(net)
-        elif atype in ("FILL", "OPTRD"):
+            continue
+
+        sym = a.get("symbol")
+        if sym not in symbol_set:
+            continue
+        if atype in ("FILL", "OPTRD"):
             # Surfaced (not silently dropped) so settle_row can flag if there are MORE
             # fills than a simple "opened 4 legs, held to expiration" position should
             # have -- extra fills mean the position was closed/adjusted before
@@ -328,7 +342,25 @@ def settle_row(trade_client, stock_data_client, row):
         fees = 0.0
         notes.append(f"Could not pull real fees ({fee_error}) -- realized_pnl below excludes fees.")
     else:
-        fees = fee_total
+        # get_fees_for_date sums FEE activity for the WHOLE DATE (see its docstring --
+        # real regulatory fees like CAT/TAF/ORF/REG are often account/day-level, not
+        # tagged with a single symbol). If more than one trade was logged on this same
+        # date, that total isn't exclusively this trade's fees -- split it evenly across
+        # same-day trades as a reasonable approximation rather than over-counting the
+        # full day's fees against every one of them.
+        same_day_trades = [
+            t for t in read_csv_rows(TRADE_LOG_CSV)
+            if t.get("date") == row["date"] and t.get("order_id")
+            and str(t.get("dry_run", "")).lower() != "true"
+        ]
+        n_same_day = max(len(same_day_trades), 1)
+        fees = fee_total / n_same_day
+        if n_same_day > 1:
+            notes.append(
+                f"{n_same_day} trades were logged on {row['date']} -- Alpaca's fee activity for "
+                f"this date (${fee_total:.2f} total) isn't reliably tagged per-symbol, so it was "
+                f"split evenly across them (${fees:.2f} each) as an approximation."
+            )
         if other_activity:
             notes.append(
                 "Other non-fill account activity found for these contracts this date (not "

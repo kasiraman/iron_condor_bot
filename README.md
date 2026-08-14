@@ -309,12 +309,24 @@ pulled from Alpaca's account activity for that date, not a guessed schedule), th
 `realized_pnl` (gross P&L + fees -- this is the number that should match your Alpaca
 dashboard), and notes (e.g. why a trade wasn't filled, or a fallback that happened).
 
-Fees are pulled from `GET /account/activities` and summed only for the exact option
-contracts traded that day, `activity_type == "FEE"` specifically (unambiguous fee line
-items). If your dashboard P&L still doesn't fully match `realized_pnl` after this,
-check the `notes` column -- any other non-fill account activity found for those
-contracts (e.g. assignment/exercise events, since SPY is physically settled) is listed
-there for you to review, since those can carry their own costs beyond a flat fee.
+Fees are pulled from `GET /account/activities`, summing every `activity_type == "FEE"`
+entry for that date (unambiguous fee line items). This is deliberately **not** filtered
+by option symbol, even though the fills/other-activity matching below is: Alpaca's real
+regulatory/exchange pass-through fees (OCC Clearing, CAT, OPT TAF, ORF, OPT REG, etc.)
+are frequently reported at the account/day level rather than tagged to a single symbol
+-- e.g. "CAT fee for proceed of 8 trades" or "ORF fee for proceed of 80 contracts",
+spanning everything traded that day. An earlier version of this filtered fees by symbol
+along with everything else, which silently excluded nearly all of them and made every
+trade look fee-free ($0.00) even on days with several dollars of real regulatory fees --
+Alpaca's *own* commissions are $0 for options, but the regulatory pass-through fees are
+real and separate from that. If more than one trade is logged on the same date, that
+date's fee total is split evenly across them (noted in the `notes` column) since the
+fee activity doesn't reliably indicate which specific trade it belongs to.
+
+If your dashboard P&L still doesn't fully match `realized_pnl` after this, check the
+`notes` column -- any other non-fill account activity found for those contracts (e.g.
+assignment/exercise events, since SPY is physically settled) is listed there for you to
+review, since those can carry their own costs beyond the fees captured above.
 
 Settlement is computed directly from the logged strikes vs. the close price — it
 doesn't rely on Alpaca to correctly report a closed P&L for expired contracts, so it
