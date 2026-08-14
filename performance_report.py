@@ -14,6 +14,10 @@ how the live results compare to the earlier backtest.
 import csv
 from pathlib import Path
 
+from bot_logging import get_logger
+
+log = get_logger("performance_report")
+
 BASE = Path(__file__).parent
 LOG_DIR = BASE / "logs"
 TRADE_LOG_CSV = LOG_DIR / "trades.csv"
@@ -67,10 +71,10 @@ def summarize(joined):
     filled = [r for r in joined if r["status"] == "filled" and r["realized_pnl"] not in ("", None)]
     not_filled = [r for r in joined if r["status"] != "filled"]
 
-    print(f"Total logged attempts: {len(joined)}  |  Filled: {len(filled)}  |  Not filled/errored: {len(not_filled)}")
+    log.info(f"Total logged attempts: {len(joined)}  |  Filled: {len(filled)}  |  Not filled/errored: {len(not_filled)}")
 
     if not filled:
-        print("No settled, filled trades yet — nothing to summarize.")
+        log.info("No settled, filled trades yet — nothing to summarize.")
         return
 
     pnls = [float(r["realized_pnl"]) for r in filled]
@@ -91,16 +95,16 @@ def summarize(joined):
         peak = max(peak, equity)
         max_dd = min(max_dd, equity - peak)
 
-    print(f"Date range:            {filled[0]['date']} to {filled[-1]['date']}")
-    print(f"Trades:                {n}")
-    print(f"Total realized P&L:    ${total_pnl:,.2f}")
-    print(f"Win rate:              {win_rate:.1%}  ({len(wins)}W / {len(losses)}L)")
-    print(f"Avg fill credit:       ${avg_fill_credit:,.2f} /contract")
-    print(f"Total fees paid:       ${total_fees:,.2f}  (already netted into P&L above)")
-    print(f"Avg win:               ${avg_win:,.2f}")
-    print(f"Avg loss:              ${avg_loss:,.2f}")
-    print(f"Max drawdown:          ${max_dd:,.2f}")
-    print(f"Final cumulative P&L:  ${equity:,.2f}")
+    log.info(f"Date range:            {filled[0]['date']} to {filled[-1]['date']}")
+    log.info(f"Trades:                {n}")
+    log.info(f"Total realized P&L:    ${total_pnl:,.2f}")
+    log.info(f"Win rate:              {win_rate:.1%}  ({len(wins)}W / {len(losses)}L)")
+    log.info(f"Avg fill credit:       ${avg_fill_credit:,.2f} /contract")
+    log.info(f"Total fees paid:       ${total_fees:,.2f}  (already netted into P&L above)")
+    log.info(f"Avg win:               ${avg_win:,.2f}")
+    log.info(f"Avg loss:              ${avg_loss:,.2f}")
+    log.info(f"Max drawdown:          ${max_dd:,.2f}")
+    log.info(f"Final cumulative P&L:  ${equity:,.2f}")
 
     try:
         import matplotlib
@@ -125,22 +129,22 @@ def summarize(joined):
         ax.grid(alpha=0.3)
         fig.tight_layout()
         fig.savefig(CHART_PNG, dpi=150)
-        print(f"\nSaved equity curve chart to {CHART_PNG}")
+        log.info(f"Saved equity curve chart to {CHART_PNG}")
     except ImportError:
-        print("\n(matplotlib not installed — skipping chart; `pip install matplotlib` to enable it)")
+        log.warning("matplotlib not installed — skipping chart; `pip install matplotlib` to enable it")
 
 
 def main():
     joined = join_trades()
     if not joined:
-        print("No settled trades found yet. Run iron_condor_bot.py then settle_trades.py first.")
+        log.info("No settled trades found yet. Run iron_condor_bot.py then settle_trades.py first.")
         return
 
     with open(JOINED_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(joined[0].keys()))
         writer.writeheader()
         writer.writerows(joined)
-    print(f"Wrote {len(joined)} joined rows to {JOINED_CSV}\n")
+    log.info(f"Wrote {len(joined)} joined rows to {JOINED_CSV}")
 
     summarize(joined)
 

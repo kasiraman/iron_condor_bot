@@ -148,6 +148,27 @@ or a small always-on VM) since it needs to stay running to fire the daily jobs.
 AM to 3:55 PM, and 4:15 PM), each with action = run the matching script's
 `.venv\Scripts\python.exe <script>.py`, "Start in" set to the project folder.
 
+## Logging
+
+All four scripts log through a shared `bot_logging.py` module instead of `print()`.
+Each script gets its own rotating log file:
+
+- `logs/iron_condor_bot.log`
+- `logs/monitor_and_exit.log`
+- `logs/settle_trades.log`
+- `logs/performance_report.log`
+
+Files rotate automatically every `LOG_ROTATE_DAYS` (30 by default), keeping
+`LOG_BACKUP_COUNT` (6 by default) old rotated files before the oldest is deleted —
+old files are renamed with a date suffix (e.g. `iron_condor_bot.log.2026-08-14`), so
+nothing is silently overwritten mid-rotation. Console output (visible when you run a
+script by hand, and still captured by cron's `>> logs/cron.log 2>&1` redirect as a
+fallback) uses the same format and level. Default level is `INFO`; override with
+`LOG_LEVEL=DEBUG`/`WARNING`/`ERROR` in `.env` if you want less or more noise. These
+log files are separate from the CSV logs (`trades.csv`, `trade_outcomes.csv`,
+`closed_early.csv`) — the CSVs are the structured data used for settlement and
+reporting; the `.log` files are the human-readable run history/diagnostics.
+
 ## Config knobs (env vars, see `.env.example`)
 
 | Variable | Default | Meaning |

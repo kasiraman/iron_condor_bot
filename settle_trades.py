@@ -39,7 +39,10 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 from alpaca.common.exceptions import APIError
 
+from bot_logging import get_logger
+
 load_dotenv()
+log = get_logger("settle_trades")
 
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -147,8 +150,8 @@ def get_close_price(stock_data_client, symbol, date_str):
         day_bars = _fetch_daily_bar(stock_data_client, symbol, day, STOCK_DATA_FEED)
     except APIError as e:
         if STOCK_DATA_FEED != DataFeed.IEX:
-            print(
-                f"NOTE: '{STOCK_DATA_FEED.value}' feed rejected for {date_str} ({e}) -- falling back "
+            log.warning(
+                f"'{STOCK_DATA_FEED.value}' feed rejected for {date_str} ({e}) -- falling back "
                 "to 'iex' for this close price. Re-run with --force --date "
                 f"{day.isoformat()} later (e.g. tomorrow or after) to pick up the more accurate sip close."
             )
@@ -405,7 +408,7 @@ def main():
             "--force without --date will re-settle EVERY previously-settled trade. Continue? [y/N] "
         )
         if confirm.strip().lower() != "y":
-            print("Aborted.")
+            log.info("Aborted.")
             return
 
     trade_client, stock_data_client = get_clients()
@@ -422,7 +425,7 @@ def main():
     pending = candidates if args.force else [r for r in candidates if r["order_id"] not in settled_ids]
 
     if not pending:
-        print("Nothing to settle.")
+        log.info("Nothing to settle.")
         return
 
     reprocessed_ids = {r["order_id"] for r in pending} if args.force else set()
@@ -439,8 +442,8 @@ def main():
                 "gross_pnl": "", "fees": "", "realized_pnl": "", "notes": str(e),
             }
         new_results.append(result)
-        print(f"{result['date']}  order={result['order_id']}  status={result['status']}  "
-              f"pnl={result['realized_pnl'] or 'n/a'}  {result['notes']}")
+        log.info(f"{result['date']}  order={result['order_id']}  status={result['status']}  "
+                 f"pnl={result['realized_pnl'] or 'n/a'}  {result['notes']}")
 
     LOG_DIR.mkdir(exist_ok=True)
     with open(OUTCOMES_CSV, "w", newline="") as f:

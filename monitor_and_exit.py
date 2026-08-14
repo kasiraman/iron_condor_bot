@@ -45,7 +45,10 @@ from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest
 from alpaca.data.enums import OptionsFeed
 
+from bot_logging import get_logger
+
 load_dotenv()
+log = get_logger("monitor_and_exit")
 
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -175,7 +178,7 @@ def evaluate_new_position(trade_client, option_data_client, row, past_cutoff, dr
     order_id = row["order_id"]
     entry_credit, entry_status = get_entry_credit(trade_client, row)
     if entry_credit is None:
-        print(f"{row['date']}  order={order_id}  entry order status={entry_status} -- not filled yet, nothing to monitor.")
+        log.info(f"{row['date']}  order={order_id}  entry order status={entry_status} -- not filled yet, nothing to monitor.")
         return None
 
     leg_syms = {
@@ -195,7 +198,7 @@ def evaluate_new_position(trade_client, option_data_client, row, past_cutoff, dr
     elif loss_pct >= STOP_LOSS_PCT:
         trigger, limit_price = "stop_loss", ctc + STOP_LOSS_BUFFER
 
-    print(
+    log.info(
         f"{row['date']}  order={order_id}  entry_credit={entry_credit:.2f}  "
         f"cost_to_close={ctc:.2f}  profit_pct={profit_pct:.1%}  loss_pct={loss_pct:.1%}"
         + (f"  -> TRIGGER {trigger}" if trigger else "  -> no action")
@@ -205,15 +208,15 @@ def evaluate_new_position(trade_client, option_data_client, row, past_cutoff, dr
         return None
 
     if past_cutoff:
-        print(f"  (past MONITOR_END_TIME={MONITOR_END_TIME} -- skipping new close, letting settle_trades.py handle it at expiration)")
+        log.info(f"  (past MONITOR_END_TIME={MONITOR_END_TIME} -- skipping new close, letting settle_trades.py handle it at expiration)")
         return None
 
     if dry_run:
-        print(f"  [DRY RUN] would submit closing order at limit_price={limit_price:.2f}")
+        log.info(f"  [DRY RUN] would submit closing order at limit_price={limit_price:.2f}")
         return None
 
     close_order = submit_closing_order(trade_client, row, limit_price)
-    print(f"  Submitted closing order id={close_order.id} limit_price={limit_price:.2f}")
+    log.info(f"  Submitted closing order id={close_order.id} limit_price={limit_price:.2f}")
 
     return {
         "date": row["date"], "order_id": order_id, "trigger": trigger,
@@ -238,11 +241,11 @@ def check_pending_close(trade_client, existing):
         existing["exit_debit"] = f"{exit_debit:.2f}"
         existing["estimated_pnl"] = f"{estimated_pnl:.2f}"
         existing["filled_at"] = now_iso()
-        print(f"{existing['date']}  order={existing['order_id']}  close order FILLED  exit_debit={exit_debit:.2f}  estimated_pnl=${estimated_pnl:.2f}")
+        log.info(f"{existing['date']}  order={existing['order_id']}  close order FILLED  exit_debit={exit_debit:.2f}  estimated_pnl=${estimated_pnl:.2f}")
         return existing, False
 
     if status in (OrderStatus.CANCELED.value, OrderStatus.REJECTED.value, OrderStatus.EXPIRED.value):
-        print(f"{existing['date']}  order={existing['order_id']}  close order {status} -- will re-evaluate fresh next run.")
+        log.warning(f"{existing['date']}  order={existing['order_id']}  close order {status} -- will re-evaluate fresh next run.")
         return existing, True  # signal: drop this row, re-evaluate from scratch next run
 
     # Still open (new/pending_new/accepted/partially_filled). Escalate if it's been
@@ -256,17 +259,17 @@ def check_pending_close(trade_client, existing):
         try:
             trade_client.cancel_order_by_id(existing["close_order_id"])
         except Exception as e:
-            print(f"  Could not cancel stale close order {existing['close_order_id']}: {e}")
+            log.error(f"  Could not cancel stale close order {existing['close_order_id']}: {e}")
             return existing, False
         new_limit = float(existing["cost_to_close_at_trigger"]) + (escalations + 1) * RESUBMIT_BUFFER_STEP
         # Need the original row's leg symbols to resubmit -- look them up from trades.csv.
         trades = read_csv_rows(TRADE_LOG_CSV)
         row = next((r for r in trades if r["order_id"] == existing["order_id"]), None)
         if row is None:
-            print(f"  Could not find original trade row for order {existing['order_id']} to resubmit -- leaving unclosed, check manually.")
+            log.error(f"  Could not find original trade row for order {existing['order_id']} to resubmit -- leaving unclosed, check manually.")
             return existing, False
         new_order = submit_closing_order(trade_client, row, new_limit)
-        print(
+        log.warning(
             f"{existing['date']}  order={existing['order_id']}  close order stale ({age_min:.1f}m, no fill) -- "
             f"canceled and resubmitted id={new_order.id} at limit_price={new_limit:.2f} (escalation #{escalations + 1})"
         )
@@ -276,7 +279,7 @@ def check_pending_close(trade_client, existing):
         return existing, False
 
     if age_min >= PENDING_CLOSE_TIMEOUT_MIN:
-        print(
+        log.error(
             f"{existing['date']}  order={existing['order_id']}  close order still unfilled after "
             f"{MAX_ESCALATIONS} escalation(s) -- giving up on automated escalation, CHECK MANUALLY."
         )
@@ -299,7 +302,7 @@ def main():
     if not args.force:
         clock = trade_client.get_clock()
         if not clock.is_open:
-            print("Market is not open right now -- exiting. Use --force to override for testing.")
+            log.info("Market is not open right now -- exiting. Use --force to override for testing.")
             return
 
     target_date = args.date or datetime.now(TIMEZONE).date().isoformat()
@@ -314,7 +317,7 @@ def main():
         if r["date"] == target_date and r.get("order_id") and str(r.get("dry_run", "")).lower() != "true"
     ]
     if not candidates:
-        print(f"No open (non-dry-run) positions logged for {target_date}.")
+        log.info(f"No open (non-dry-run) positions logged for {target_date}.")
         return
 
     closed_rows = read_csv_rows(CLOSED_EARLY_CSV)

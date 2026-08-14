@@ -24,7 +24,6 @@ IMPORTANT -- read before relying on this:
 
 import argparse
 import csv
-import logging
 import math
 import os
 from datetime import datetime, timedelta, date
@@ -35,6 +34,8 @@ import numpy as np
 from dotenv import load_dotenv
 from scipy.optimize import brentq
 from scipy.stats import norm
+
+from bot_logging import get_logger
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -82,11 +83,7 @@ OPTION_DATA_FEED = OptionsFeed(os.getenv("OPTION_DATA_FEED", "indicative"))
 
 TIMEZONE = ZoneInfo("America/New_York")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("iron_condor_bot")
+log = get_logger("iron_condor_bot")
 
 
 # --------------------------------------------------------------------------
@@ -229,7 +226,27 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
     log.info(f"{UNDERLYING} spot: {spot:.2f}")
 
     calls, puts = get_today_chain(trade_client, UNDERLYING, spot, target_date=target_date)
-    T = year_fraction_to_close(now)
+
+    market_open_dt = now.replace(hour=9, minute=31, second=0, microsecond=0)
+    market_close_dt = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now < market_open_dt or now >= market_close_dt:
+        # Outside real market hours -- almost always means --force testing (weekend, holiday,
+        # or just running this at night). The real wall-clock time-to-close is meaningless here
+        # (negative/near-zero after the close), which used to collapse T to a 1-second floor and
+        # blow up the IV solve into nonsense (e.g. 496% IV from a stale after-hours straddle
+        # quote) -- producing strikes so close together they'd round to the same contract on one
+        # side, and a broken (negative) net credit. Simulate a normal 9:31 AM ET entry instead so
+        # --force testing behaves sanely no matter what time of day you actually run it. A real
+        # scheduled run during market hours never hits this branch.
+        reference_for_T = market_open_dt
+        log.warning(
+            f"Current time ({now.strftime('%H:%M %Z')}) is outside real market hours (9:30-16:00 ET) -- "
+            "simulating time-to-close as if it were 9:31 AM ET for T/IV/EM purposes."
+        )
+    else:
+        reference_for_T = now
+
+    T = year_fraction_to_close(reference_for_T)
 
     if test_iv is not None:
         iv = test_iv
