@@ -117,6 +117,19 @@ Notes on that block:
 - This assumes your machine's system timezone is already `America/New_York`. If it runs
   in UTC (common for cloud VMs), use the timezone-aware APScheduler alternative in
   "Scheduling the entry job" below instead — it can run all three jobs from one script.
+
+**Entry timing matters.** `iron_condor_bot.py` is designed to enter once near 9:31 AM
+ET, with the full trading day still ahead. Expected Move scales with `sqrt(time
+remaining until close)`, so if you run it for real (no `--test-iv`) later in the day,
+it correctly uses the smaller *real* remaining time — EM shrinks a lot as the day goes
+on, which can push the short strikes close enough to the money that the wing width
+rounds up to SPY's $1 minimum increment, and the bid/ask spread on that thin, near-ATM
+spread can eat the whole credit (or flip it slightly negative, which the bot correctly
+refuses to submit rather than trading a degenerate position). That's expected behavior,
+not a bug, if you manually test mid-day. To see a consistent, full-day-equivalent test
+result regardless of what time you actually run it, use `--test-iv` (e.g. `--test-iv
+0.15`) — it always simulates a 9:31 AM entry for the T/IV/EM math, not the real current
+time.
 - `performance_report.py` is intentionally not on this list — run it by hand whenever you
   want a read on results (see "Checking in on performance" below).
 

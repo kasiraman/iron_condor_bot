@@ -273,20 +273,36 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
 
     market_open_dt = now.replace(hour=9, minute=31, second=0, microsecond=0)
     market_close_dt = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    if now < market_open_dt or now >= market_close_dt:
-        # Outside real market hours -- almost always means --force testing (weekend, holiday,
-        # or just running this at night). The real wall-clock time-to-close is meaningless here
-        # (negative/near-zero after the close), which used to collapse T to a 1-second floor and
-        # blow up the IV solve into nonsense (e.g. 496% IV from a stale after-hours straddle
-        # quote) -- producing strikes so close together they'd round to the same contract on one
-        # side, and a broken (negative) net credit. Simulate a normal 9:31 AM ET entry instead so
-        # --force testing behaves sanely no matter what time of day you actually run it. A real
-        # scheduled run during market hours never hits this branch.
+    outside_hours = now < market_open_dt or now >= market_close_dt
+
+    if outside_hours or test_iv is not None:
+        # Simulate a normal 9:31 AM ET entry instead of using the real wall-clock time, in
+        # two situations:
+        #   1. Outside real market hours (weekend, holiday, or just running this at night) --
+        #      the real time-to-close is meaningless there (negative/near-zero after the close,
+        #      which used to collapse T to a 1-second floor and blow up the IV solve into
+        #      nonsense like 496% IV).
+        #   2. --test-iv is set -- this is explicitly a structural/logic test, and should give
+        #      the same, consistent "as if this were market open" result no matter what time of
+        #      day you actually run it. Without this, running --test-iv mid-afternoon would still
+        #      use the real (small) remaining time and produce a misleadingly thin/degenerate
+        #      condor that has nothing to do with what a real 9:31 AM entry would look like.
+        # NOTE: this does NOT apply to a real run during real market hours without --test-iv --
+        # that intentionally reflects the true remaining time-to-close, since EM (and therefore
+        # the strikes) legitimately shrinks as the day goes on. This bot is designed to enter
+        # once near 9:31 AM ET; running it for real later in the day and getting a thinner/no
+        # credit is expected behavior, not a bug -- see the "Entry timing" note in the README.
         reference_for_T = market_open_dt
-        log.warning(
-            f"Current time ({now.strftime('%H:%M %Z')}) is outside real market hours (9:30-16:00 ET) -- "
-            "simulating time-to-close as if it were 9:31 AM ET for T/IV/EM purposes."
-        )
+        if outside_hours:
+            log.warning(
+                f"Current time ({now.strftime('%H:%M %Z')}) is outside real market hours (9:30-16:00 ET) -- "
+                "simulating time-to-close as if it were 9:31 AM ET for T/IV/EM purposes."
+            )
+        else:
+            log.warning(
+                "--test-iv set: simulating time-to-close as if it were 9:31 AM ET (not the actual "
+                "current time), so structural testing is consistent regardless of when you run it."
+            )
     else:
         reference_for_T = now
 
