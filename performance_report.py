@@ -1,16 +1,26 @@
 """
-Performance report for the live (paper) SPY 0DTE iron condor runs.
+Performance report for the live (paper) SPY iron condor runs -- covers EITHER the 0DTE
+strategy or the weekend (Friday->Monday) strategy, selected via --strategy.
 
-Joins logs/trades.csv (entry log, written by iron_condor_bot.py) with
-logs/trade_outcomes.csv (settlement log, written by settle_trades.py) and prints
-the same style of summary stats used in the backtest, plus writes:
-  - logs/trade_performance.csv   (the joined, per-trade table)
-  - logs/performance_equity_curve.png
+For --strategy 0dte (the default, for backwards compatibility with existing usage):
+  Joins logs/trades.csv (entry log, written by 0dte_iron_condor_bot.py) with
+  logs/trade_outcomes.csv (settlement log, written by 0dte_settle_trades.py).
+  Writes logs/trade_performance.csv and logs/performance_equity_curve.png.
+
+For --strategy weekend:
+  Joins logs/weekend_trades.csv (entry log, written by weekend_iron_condor_bot.py) with
+  logs/weekend_trade_outcomes.csv (settlement log, written by weekend_settle_trades.py).
+  Writes logs/weekend_trade_performance.csv and logs/weekend_performance_equity_curve.png.
+
+Each strategy's numbers are entirely separate -- run this once per strategy (e.g. once
+for each) rather than expecting a single combined P&L, since they have different risk
+budgets, different holding periods, and are meant to be evaluated on their own merits.
 
 Run this anytime — e.g. weekly, or after your 3-month collection window — to see
 how the live results compare to the earlier backtest.
 """
 
+import argparse
 import csv
 from pathlib import Path
 
@@ -20,10 +30,23 @@ log = get_logger("performance_report")
 
 BASE = Path(__file__).parent
 LOG_DIR = BASE / "logs"
-TRADE_LOG_CSV = LOG_DIR / "trades.csv"
-OUTCOMES_CSV = LOG_DIR / "trade_outcomes.csv"
-JOINED_CSV = LOG_DIR / "trade_performance.csv"
-CHART_PNG = LOG_DIR / "performance_equity_curve.png"
+
+STRATEGIES = {
+    "0dte": {
+        "trade_log": LOG_DIR / "trades.csv",
+        "outcomes": LOG_DIR / "trade_outcomes.csv",
+        "joined": LOG_DIR / "trade_performance.csv",
+        "chart": LOG_DIR / "performance_equity_curve.png",
+        "chart_title": "SPY 0DTE Iron Condor — Live Paper Trading Cumulative P&L",
+    },
+    "weekend": {
+        "trade_log": LOG_DIR / "weekend_trades.csv",
+        "outcomes": LOG_DIR / "weekend_trade_outcomes.csv",
+        "joined": LOG_DIR / "weekend_trade_performance.csv",
+        "chart": LOG_DIR / "weekend_performance_equity_curve.png",
+        "chart_title": "SPY Weekend (Fri->Mon) Iron Condor — Live Paper Trading Cumulative P&L",
+    },
+}
 
 
 def read_csv_rows(path):
@@ -33,9 +56,9 @@ def read_csv_rows(path):
         return list(csv.DictReader(f))
 
 
-def join_trades():
-    trades = {r["order_id"]: r for r in read_csv_rows(TRADE_LOG_CSV) if r.get("order_id")}
-    outcomes = read_csv_rows(OUTCOMES_CSV)
+def join_trades(paths):
+    trades = {r["order_id"]: r for r in read_csv_rows(paths["trade_log"]) if r.get("order_id")}
+    outcomes = read_csv_rows(paths["outcomes"])
 
     joined = []
     for o in outcomes:
@@ -44,6 +67,7 @@ def join_trades():
             continue
         joined.append({
             "date": o["date"],
+            "expiration_date": o.get("expiration_date", o["date"]),
             "order_id": o["order_id"],
             "status": o["status"],
             "spot_open": t["spot"],
@@ -67,7 +91,7 @@ def join_trades():
     return joined
 
 
-def summarize(joined):
+def summarize(joined, paths):
     filled = [r for r in joined if r["status"] == "filled" and r["realized_pnl"] not in ("", None)]
     not_filled = [r for r in joined if r["status"] != "filled"]
 
@@ -122,31 +146,41 @@ def summarize(joined):
         fig, ax = plt.subplots(figsize=(9, 4.5))
         ax.plot(dates, eq_curve, color="#16a34a", linewidth=1.8)
         ax.axhline(0, color="#888", linewidth=0.8)
-        ax.set_title("SPY 0DTE Iron Condor — Live Paper Trading Cumulative P&L")
+        ax.set_title(paths["chart_title"])
         ax.set_ylabel("Cumulative P&L ($)")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
         fig.autofmt_xdate()
         ax.grid(alpha=0.3)
         fig.tight_layout()
-        fig.savefig(CHART_PNG, dpi=150)
-        log.info(f"Saved equity curve chart to {CHART_PNG}")
+        fig.savefig(paths["chart"], dpi=150)
+        log.info(f"Saved equity curve chart to {paths['chart']}")
     except ImportError:
         log.warning("matplotlib not installed — skipping chart; `pip install matplotlib` to enable it")
 
 
 def main():
-    joined = join_trades()
+    parser = argparse.ArgumentParser(description="Performance report for live iron condor trading (0DTE or weekend strategy).")
+    parser.add_argument(
+        "--strategy", choices=sorted(STRATEGIES.keys()), default="0dte",
+        help="Which strategy's logs to report on (default: 0dte).",
+    )
+    args = parser.parse_args()
+    paths = STRATEGIES[args.strategy]
+
+    joined = join_trades(paths)
     if not joined:
-        log.info("No settled trades found yet. Run iron_condor_bot.py then settle_trades.py first.")
+        entry_script = "0dte_iron_condor_bot.py" if args.strategy == "0dte" else "weekend_iron_condor_bot.py"
+        settle_script = "0dte_settle_trades.py" if args.strategy == "0dte" else "weekend_settle_trades.py"
+        log.info(f"No settled '{args.strategy}' trades found yet. Run {entry_script} then {settle_script} first.")
         return
 
-    with open(JOINED_CSV, "w", newline="") as f:
+    with open(paths["joined"], "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(joined[0].keys()))
         writer.writeheader()
         writer.writerows(joined)
-    log.info(f"Wrote {len(joined)} joined rows to {JOINED_CSV}")
+    log.info(f"Wrote {len(joined)} joined rows to {paths['joined']}")
 
-    summarize(joined)
+    summarize(joined, paths)
 
 
 if __name__ == "__main__":
