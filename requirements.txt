@@ -2,4 +2,7 @@ alpaca-py>=0.33
 python-dotenv>=1.0
 scipy>=1.11
 numpy>=1.26
-pandas>=2.1
+
+# Optional -- only needed for extras, not the live bots themselves:
+# matplotlib   (performance_report.py's equity-curve chart; degrades gracefully without it)
+# pandas       (only used by the original backtest.py research script)

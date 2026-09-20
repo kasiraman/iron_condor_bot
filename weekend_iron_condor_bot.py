@@ -21,11 +21,19 @@ Strategy (see weekend_time.py for the full T-convention rationale):
   2. Solve implied volatility off the ATM straddle for that expiration, using CALENDAR T
      (real elapsed time, weekend included) -- this matches how the market actually prices
      time value across the weekend.
-  3. Expected Move: EM = spot * IV * sqrt(TRADING_HOURS_T), where TRADING_HOURS_T counts
-     ONLY real trading-session time between now and expiration (excluding the weekend
-     entirely). This intentionally sizes strikes tighter than calendar-T would, which is
-     what's meant to capture the weekend-decay edge -- and is exactly what concentrates
-     more of the position's risk into the weekend gap described above.
+  3. Expected Move has two components, combined in quadrature (i.e. combined as
+     independent variances): sqrt(trading_hours_component^2 + weekend_gap_component^2).
+       - trading_hours_component = spot * IV * sqrt(TRADING_HOURS_T), where TRADING_HOURS_T
+         counts ONLY real trading-session time between now and expiration (excluding the
+         weekend entirely) -- same idea as before.
+       - weekend_gap_component is estimated from REAL HISTORICAL SPY close-to-next-open
+         jumps across past weekends/holidays (see estimate_weekend_gap_em() below), not
+         modeled from IV. Options IV mostly reflects trading-hours-scale movement and
+         doesn't cleanly separate out weekend-specific jump risk on its own -- actual
+         historical gap data is a more direct measurement of that risk than guessing at
+         a bigger multiplier. This component is what's new here: earlier versions of this
+         bot used ONLY the trading-hours component, which repeatedly undersized strikes
+         and led to real losses once actual weekend gaps happened.
   4. Short strikes  = spot +/- (WEEKEND_EM_MULTIPLIER * EM)
   5. Long strikes   = short strike +/- (WEEKEND_WING_FRACTION * EM)
   6. Submit a single 4-leg MLEG limit order (sell iron condor) on Alpaca.
@@ -52,7 +60,8 @@ import argparse
 import csv
 import math
 import os
-from datetime import datetime, date, time as dtime
+import statistics
+from datetime import datetime, date, time as dtime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -85,9 +94,11 @@ from alpaca.trading.enums import (
     OrderSide,
     TimeInForce,
 )
+from alpaca.common.exceptions import APIError
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient, StockLatestTradeRequest
-from alpaca.data.requests import OptionLatestQuoteRequest
+from alpaca.data.requests import OptionLatestQuoteRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed, OptionsFeed
 
 # --------------------------------------------------------------------------
@@ -115,6 +126,16 @@ RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.05"))
 STRIKE_RANGE_PCT = float(os.getenv("WEEKEND_STRIKE_RANGE_PCT", "0.08"))
 CREDIT_BUFFER = float(os.getenv("WEEKEND_CREDIT_BUFFER", "0.05"))
 
+# Historical weekend/holiday gap buffer -- see estimate_weekend_gap_em() below and the
+# module docstring's Expected Move section. Widens strikes based on REAL observed
+# SPY close-to-next-open jumps across past weekends/holidays, combined in quadrature with
+# the trading-hours EM component, rather than relying on trading-hours EM alone (which
+# has no way to reflect price movement while markets are closed).
+_gap_buffer_env = os.getenv("WEEKEND_GAP_BUFFER_ENABLED", "true").strip().lower()
+GAP_BUFFER_ENABLED = _gap_buffer_env not in ("false", "0", "no", "off")
+GAP_LOOKBACK_DAYS = int(os.getenv("WEEKEND_GAP_LOOKBACK_DAYS", "730"))  # ~2 years of history
+GAP_MIN_SAMPLES = int(os.getenv("WEEKEND_GAP_MIN_SAMPLES", "20"))  # below this, skip the buffer rather than trust a thin sample
+
 # Minimum real calendar-day gap to the next trading session for this bot to consider
 # itself "a real weekend entry" -- see the module docstring. 2 covers a plain Friday ->
 # Monday weekend; it's naturally larger (3+) before a long weekend/holiday.
@@ -130,6 +151,12 @@ MAX_RISK_PER_TRADE_USD = float(_max_risk_usd_env) if _max_risk_usd_env else None
 MAX_RISK_PER_TRADE_PCT = float(_max_risk_pct_env) if _max_risk_pct_env else None  # fraction, e.g. 0.02 = 2%
 if MAX_RISK_PER_TRADE_USD is None and MAX_RISK_PER_TRADE_PCT is None:
     MAX_RISK_PER_TRADE_USD = 500.0
+
+# INFORMATIONAL ONLY -- see the identical comment in 0dte_iron_condor_bot.py. Read here
+# purely to log how much smaller a cleanly-firing stop loss would be versus the
+# max-theoretical-loss figure qty is actually sized against; does not affect sizing. The
+# real, behavior-controlling copy lives in weekend_monitor_and_exit.py.
+STOP_LOSS_PCT_INFO = float(os.getenv("WEEKEND_STOP_LOSS_PCT", "1.20"))
 
 LOG_DIR = Path(__file__).parent / "logs"
 TRADE_LOG_CSV = LOG_DIR / "weekend_trades.csv"  # separate from the 0DTE bot's trades.csv on purpose
@@ -213,6 +240,83 @@ def get_spot_price(stock_data_client, symbol):
     req = StockLatestTradeRequest(symbol_or_symbols=symbol, feed=STOCK_DATA_FEED)
     resp = stock_data_client.get_stock_latest_trade(req)
     return float(resp[symbol].price)
+
+
+def _fetch_daily_bars_range(stock_data_client, symbol, start, end, feed):
+    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start, end=end, feed=feed)
+    bars = stock_data_client.get_stock_bars(req)
+    return bars[symbol]
+
+
+def estimate_weekend_gap_em(stock_data_client, symbol, spot, gap_calendar_days):
+    """Estimates the dollar weekend/holiday GAP-RISK component of Expected Move, from
+    REAL historical close-to-next-open jumps -- not modeled from IV. Options IV mostly
+    reflects trading-hours-scale price movement; it doesn't cleanly separate out how much
+    of that "vol" is actually priced-in weekend jump risk versus ordinary intraday
+    movement, so guessing at it via a bigger multiplier on the trading-hours EM has no
+    real grounding. This instead measures it directly: every time SPY's daily bars show a
+    gap of >= 2 calendar days between one session's close and the next session's open
+    (i.e. a weekend or a market holiday sat in between), that's a real, observed jump the
+    market made while this strategy would have been unable to react to it -- exactly the
+    risk this bot is exposed to every time it holds over a weekend.
+
+    Each observed gap return is normalized to a "per sqrt(calendar day)" rate (dividing by
+    sqrt(days_between), consistent with the sqrt(T) scaling used everywhere else in this
+    codebase), so a plain 2-day weekend and a 4-day holiday weekend both contribute to one
+    shared distribution rather than needing separate buckets. The sample standard
+    deviation of that rate is then rescaled by sqrt(gap_calendar_days) for the SPECIFIC
+    gap this trade is about to sit through, and returned as a dollar EM-style figure
+    (spot * rate). The caller combines this in quadrature with the trading-hours EM
+    component -- i.e. as independent variances: total_EM = sqrt(a^2 + b^2) -- rather than
+    just adding them, since the two are assumed to be roughly independent risk sources
+    (ordinary intraday movement vs. weekend-specific jumps).
+
+    Returns (gap_em_dollars, n_samples). Returns (0.0, n_samples) -- i.e. no buffer
+    applied -- if WEEKEND_GAP_BUFFER_ENABLED is false, if historical bars can't be
+    fetched, or if fewer than WEEKEND_GAP_MIN_SAMPLES real gaps are found in the lookback
+    window (trusting a thin sample would be worse than not applying a buffer at all).
+    """
+    if not GAP_BUFFER_ENABLED:
+        return 0.0, 0
+
+    end = datetime.now(TIMEZONE).date()
+    start = end - timedelta(days=GAP_LOOKBACK_DAYS)
+
+    try:
+        bars = _fetch_daily_bars_range(stock_data_client, symbol, start, end, STOCK_DATA_FEED)
+    except APIError as e:
+        if STOCK_DATA_FEED == DataFeed.IEX:
+            log.warning(f"Could not fetch historical daily bars for the weekend-gap buffer ({e}) -- proceeding without it.")
+            return 0.0, 0
+        log.warning(f"'{STOCK_DATA_FEED.value}' feed rejected for the historical gap lookback ({e}) -- falling back to 'iex'.")
+        try:
+            bars = _fetch_daily_bars_range(stock_data_client, symbol, start, end, DataFeed.IEX)
+        except Exception as e2:
+            log.warning(f"Could not fetch historical daily bars for the weekend-gap buffer ({e2}) -- proceeding without it.")
+            return 0.0, 0
+
+    if not bars or len(bars) < 2:
+        log.warning("Not enough historical daily bars returned for the weekend-gap buffer -- proceeding without it.")
+        return 0.0, 0
+
+    gap_rates = []
+    for prev, cur in zip(bars, bars[1:]):
+        days_between = (cur.timestamp.date() - prev.timestamp.date()).days
+        if days_between >= 2 and prev.close and float(prev.close) > 0:
+            gap_return = (float(cur.open) - float(prev.close)) / float(prev.close)
+            gap_rates.append(gap_return / math.sqrt(days_between))
+
+    n = len(gap_rates)
+    if n < GAP_MIN_SAMPLES:
+        log.warning(
+            f"Only {n} historical weekend/holiday gap sample(s) found in the last {GAP_LOOKBACK_DAYS} days "
+            f"(need >= {GAP_MIN_SAMPLES}) -- proceeding without a gap buffer (trading-hours EM only)."
+        )
+        return 0.0, n
+
+    stdev_per_sqrt_day = statistics.stdev(gap_rates)
+    gap_em = spot * stdev_per_sqrt_day * math.sqrt(gap_calendar_days)
+    return gap_em, n
 
 
 def get_chain_for_expiration(trade_client, symbol, spot, expiration_date):
@@ -360,8 +464,23 @@ def build_weekend_iron_condor(trade_client, option_data_client, stock_data_clien
         iv = float(np.mean(ivs))
         log.info(f"ATM straddle mid: call={call_mid:.2f} put={put_mid:.2f} -> IV={iv:.1%}")
 
-    em = spot * iv * math.sqrt(T_sizing)
-    log.info(f"Expected Move (EM, trading-hours T): {em:.2f}  ({em/spot:.2%} of spot)")
+    trading_hours_em = spot * iv * math.sqrt(T_sizing)
+    gap_em, n_gap_samples = estimate_weekend_gap_em(stock_data_client, UNDERLYING, spot, gap_days)
+
+    if gap_em > 0:
+        em = math.sqrt(trading_hours_em ** 2 + gap_em ** 2)
+        log.info(
+            f"Expected Move -- trading-hours component: {trading_hours_em:.2f} ({trading_hours_em/spot:.2%} of spot) | "
+            f"historical weekend-gap component: {gap_em:.2f} ({gap_em/spot:.2%} of spot, from {n_gap_samples} "
+            f"historical gap samples over the last {GAP_LOOKBACK_DAYS} days, scaled to this {gap_days}-day gap) | "
+            f"combined EM: {em:.2f} ({em/spot:.2%} of spot)"
+        )
+    else:
+        em = trading_hours_em
+        log.info(
+            f"Expected Move (trading-hours component only, no gap buffer applied -- see prior warning): "
+            f"{em:.2f}  ({em/spot:.2%} of spot)"
+        )
 
     short_put_target = spot - EM_MULTIPLIER * em
     short_call_target = spot + EM_MULTIPLIER * em
@@ -421,19 +540,40 @@ def build_weekend_iron_condor(trade_client, option_data_client, stock_data_clien
     risk_budget = compute_risk_budget(trade_client)
     max_affordable_qty = math.floor(risk_budget / risk_per_contract)
     if max_affordable_qty < 1:
-        raise RuntimeError(
+        log.warning(
             f"Even 1 contract's risk (${risk_per_contract:.2f}) exceeds the risk budget "
-            f"(${risk_budget:.2f}) -- aborting. Raise WEEKEND_MAX_RISK_PER_TRADE_USD/PCT, or check "
-            "whether WEEKEND_EM_MULTIPLIER/WEEKEND_WING_FRACTION are producing wider wings than intended."
+            f"(${risk_budget:.2f}) -- skipping entry this weekend, no order submitted. This usually just "
+            "means a low-IV setup produced a tight condor whose risk/contract happens to exceed budget; "
+            "if you want to trade through setups like this, raise WEEKEND_MAX_RISK_PER_TRADE_USD/PCT. (If "
+            "this fires often, also check whether WEEKEND_EM_MULTIPLIER/WEEKEND_WING_FRACTION are "
+            "producing wider wings than intended.)"
         )
+        return None
 
     qty = min(QTY, max_affordable_qty)
     max_risk = risk_per_contract * qty
 
+    # INFORMATIONAL ONLY (see STOP_LOSS_PCT_INFO above) -- does not affect qty/max_risk.
+    # Worth noting for THIS strategy specifically: a cleanly-firing stop-loss can only
+    # help on the expiration day itself -- it offers no protection at all during the
+    # weekend/holiday gap this position sits through, which is exactly the scenario the
+    # max-loss sizing above is really guarding against. Don't read a low utilization_pct
+    # here as "safe to size up" without accounting for that.
+    stop_loss_risk_per_contract = STOP_LOSS_PCT_INFO * net_credit * 100
+    stop_loss_implied_risk = stop_loss_risk_per_contract * qty
+    utilization_pct = (stop_loss_risk_per_contract / risk_per_contract) if risk_per_contract else 0.0
+
     log.info(
-        f"Net credit (mid): {net_credit:.2f}/contract | Risk/contract: ${risk_per_contract:.2f} | "
+        f"Net credit (mid): {net_credit:.2f}/contract | Risk/contract (max loss, used for sizing): ${risk_per_contract:.2f} | "
         f"Max affordable qty: {max_affordable_qty} (budget ${risk_budget:.2f}) | QTY cap: {QTY} | "
         f"Using qty={qty} | Max risk: ${max_risk:.2f}"
+    )
+    log.info(
+        f"[sizing info] If the stop-loss fires cleanly at its configured {STOP_LOSS_PCT_INFO:.0%} threshold "
+        f"on the expiration day: ${stop_loss_risk_per_contract:.2f}/contract (${stop_loss_implied_risk:.2f} at "
+        f"qty={qty}) -- {utilization_pct:.1%} of the max-loss figure this trade is sized against. But that stop "
+        f"offers NO protection over the weekend/holiday gap itself -- see README's 'Contract sizing vs. "
+        f"stop-loss' section before treating this gap as spare capacity."
     )
 
     return {
@@ -556,6 +696,8 @@ def main():
         trade_client, option_data_client, stock_data_client,
         entry_date=entry_date, test_iv=args.test_iv,
     )
+    if plan is None:
+        return  # already logged why (e.g. risk budget can't afford even 1 contract this weekend)
 
     if args.dry_run:
         log.info("--dry-run set: not submitting order.")

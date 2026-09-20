@@ -12,7 +12,9 @@ Strategy:
   3. Expected Move:  EM = spot * IV * sqrt(DTE_fraction / 365)
      where DTE_fraction is the remaining fraction of the trading day (time now -> 4:00pm ET),
      expressed as a day-count, consistent with the IV solve's own T.
-  4. Short strikes  = spot +/- (EM_MULTIPLIER * EM)      [default 1.25x]
+  4. Short strikes  = spot +/- (EM_MULTIPLIER * EM)      [default 1.25x, or a backtest-
+     calibrated value when EM_MULTIPLIER_MODE=calibrated -- see em_multiplier_calibration.py
+     and the README's "Data-driven EM multiplier" section]
   5. Long strikes   = short strike +/- (WING_FRACTION * EM)  [default 0.5x, i.e. wing width scales with EM]
   6. Submit a single 4-leg MLEG limit order (sell iron condor) on Alpaca.
 
@@ -41,6 +43,8 @@ from scipy.stats import norm
 
 from bot_logging import get_logger
 from alpaca_config import ALPACA_PAPER, API_KEY, SECRET_KEY
+from em_multiplier_calibration import calibrate_em_multiplier
+from event_calendar import is_event_day, event_labels
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -71,6 +75,22 @@ load_dotenv()
 UNDERLYING = os.getenv("UNDERLYING", "SPY")
 EM_MULTIPLIER = float(os.getenv("EM_MULTIPLIER", "1.25"))      # short strike = spot +/- EM_MULTIPLIER * EM
 WING_FRACTION = float(os.getenv("WING_FRACTION", "0.5"))       # long strike = short +/- WING_FRACTION * EM
+
+# Data-driven alternative to manually toggling EM_MULTIPLIER by hand -- see
+# em_multiplier_calibration.py and the README's "Data-driven EM multiplier" section
+# before trusting this. Defaults OFF ("fixed", using EM_MULTIPLIER above unchanged) since
+# this changes live strike placement and hasn't been observed on a real account yet --
+# test with --dry-run (and ideally a stretch of paper trading) before setting
+# EM_MULTIPLIER_MODE=calibrated in .env. Once enabled, it computes EM_MULTIPLIER from a
+# historical backtest each run, falling back to the fixed EM_MULTIPLIER (with a warning)
+# whenever there isn't enough historical data to trust.
+EM_MULTIPLIER_MODE = os.getenv("EM_MULTIPLIER_MODE", "fixed").lower()
+EM_MULTIPLIER_TARGET_PERCENTILE = float(os.getenv("EM_MULTIPLIER_TARGET_PERCENTILE", "95"))
+EM_MULTIPLIER_LOOKBACK_DAYS = int(os.getenv("EM_MULTIPLIER_LOOKBACK_DAYS", "730"))
+EM_MULTIPLIER_VOL_WINDOW = int(os.getenv("EM_MULTIPLIER_VOL_WINDOW", "20"))
+EM_MULTIPLIER_MIN_SAMPLES = int(os.getenv("EM_MULTIPLIER_MIN_SAMPLES", "20"))
+if EM_MULTIPLIER_MODE not in ("fixed", "calibrated"):
+    raise RuntimeError(f"EM_MULTIPLIER_MODE must be 'fixed' or 'calibrated', got {EM_MULTIPLIER_MODE!r}.")
 QTY = int(os.getenv("QTY", "1"))  # ceiling on contracts/leg -- actual qty is sized down to fit the risk budget below
 RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.05"))
 STRIKE_RANGE_PCT = float(os.getenv("STRIKE_RANGE_PCT", "0.08"))  # how wide a strike window to pull from the chain
@@ -87,8 +107,23 @@ MAX_RISK_PER_TRADE_USD = float(_max_risk_usd_env) if _max_risk_usd_env else None
 MAX_RISK_PER_TRADE_PCT = float(_max_risk_pct_env) if _max_risk_pct_env else None  # fraction, e.g. 0.02 = 2%
 if MAX_RISK_PER_TRADE_USD is None and MAX_RISK_PER_TRADE_PCT is None:
     MAX_RISK_PER_TRADE_USD = 500.0
+
+# INFORMATIONAL ONLY -- read here purely to log how much smaller a cleanly-firing stop
+# loss would be versus the max-theoretical-loss figure qty is actually sized against
+# (see the "Net credit" log line in build_iron_condor()). This does NOT change sizing --
+# qty is still floor(risk_budget / max_loss_per_contract), full stop. The real,
+# behavior-controlling copy of this value lives in 0dte_monitor_and_exit.py; it's read
+# again here (same env var, same default) only so this log line reflects whatever you've
+# actually configured the monitor's stop-loss to be. Max-loss sizing is intentionally
+# more conservative than a stop-loss-based figure would be, since the stop can't be
+# trusted to fire cleanly in every scenario (monitor downtime, the post-MONITOR_END_TIME
+# blind window, slow/illiquid fills during a fast move) -- see the README's "Contract
+# sizing vs. stop-loss" section for the full discussion.
+STOP_LOSS_PCT_INFO = float(os.getenv("STOP_LOSS_PCT", "1.20"))
+
 LOG_DIR = Path(__file__).parent / "logs"
 TRADE_LOG_CSV = LOG_DIR / "trades.csv"  # unprefixed on purpose -- preserves existing trade history
+EM_MULTIPLIER_LOG_CSV = LOG_DIR / "em_multiplier_log.csv"
 
 # Free/basic Alpaca accounts only get the IEX stock feed and "indicative" (not real-time
 # OPRA) option data -- the SDK's defaults require a paid subscription and raise
@@ -268,7 +303,13 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
     calc are both skipped, in favor of a fixed IV and Black-Scholes theoretical leg prices.
     This is for structural/logic testing when the market is closed (or quotes are otherwise
     stale/empty, e.g. testing against tomorrow's just-listed contracts over a weekend) --
-    real trading days should NOT need --test-iv, since real quotes will be live."""
+    real trading days should NOT need --test-iv, since real quotes will be live.
+
+    Returns None (after logging why) if today's risk budget can't afford even 1 contract at
+    the computed strikes/credit -- this is an expected, non-error outcome (e.g. a low-IV day
+    producing a tight condor whose risk/contract happens to exceed budget), not a bug, so it
+    does not raise. A non-positive net credit or other structural problem with quotes still
+    raises RuntimeError, since that indicates something is actually wrong with the pipeline."""
     now = datetime.now(TIMEZONE)
     spot = get_spot_price(stock_data_client, UNDERLYING)
     log.info(f"{UNDERLYING} spot: {spot:.2f}")
@@ -344,8 +385,64 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
     em = spot * iv * math.sqrt(T)
     log.info(f"Expected Move (EM): {em:.2f}  ({em/spot:.2%} of spot)")
 
-    short_put_target = spot - EM_MULTIPLIER * em
-    short_call_target = spot + EM_MULTIPLIER * em
+    effective_multiplier = EM_MULTIPLIER
+    calibrated_multiplier = None
+    n_samples = 0
+    today_for_calibration = target_date or now.date()
+    is_event = is_event_day(today_for_calibration)
+    labels = event_labels(today_for_calibration) if is_event else []
+    detail = "fixed (EM_MULTIPLIER_MODE=fixed)"
+
+    if EM_MULTIPLIER_MODE == "calibrated":
+        calibrated_multiplier, n_samples, is_event, detail = calibrate_em_multiplier(
+            stock_data_client, UNDERLYING, today_for_calibration,
+            lookback_days=EM_MULTIPLIER_LOOKBACK_DAYS,
+            vol_window=EM_MULTIPLIER_VOL_WINDOW,
+            target_percentile=EM_MULTIPLIER_TARGET_PERCENTILE,
+            min_samples=EM_MULTIPLIER_MIN_SAMPLES,
+            feed=STOCK_DATA_FEED,
+        )
+        labels = event_labels(today_for_calibration) if is_event else []
+        if calibrated_multiplier is not None:
+            effective_multiplier = calibrated_multiplier
+            event_note = f"EVENT DAY ({', '.join(labels)})" if is_event else "ordinary day"
+            log.info(
+                f"EM multiplier: {effective_multiplier:.3f} [calibrated, {detail}, n={n_samples}, "
+                f"{event_note}, target percentile={EM_MULTIPLIER_TARGET_PERCENTILE:.0f}] "
+                f"(fixed fallback would be {EM_MULTIPLIER})"
+            )
+        else:
+            log.warning(
+                f"Could not compute a calibrated EM multiplier ({detail}) -- falling back to the "
+                f"fixed EM_MULTIPLIER={EM_MULTIPLIER}."
+            )
+    else:
+        log.info(f"EM multiplier: {effective_multiplier} [fixed -- set EM_MULTIPLIER_MODE=calibrated to use the backtest instead]")
+
+    # Logged to its own CSV (not trades.csv -- that schema is fixed/append-only) so the
+    # calibrated-vs-fixed decision can be reviewed later regardless of which mode was
+    # actually used to trade that day, including days that were --dry-run, --test-iv, or
+    # skipped entirely (e.g. risk budget too small) -- see log_multiplier_decision().
+    log_multiplier_decision({
+        "date": today_for_calibration.isoformat(),
+        "timestamp": now.isoformat(),
+        "mode": EM_MULTIPLIER_MODE,
+        "test_iv_mode": test_iv is not None,
+        "fixed_multiplier": EM_MULTIPLIER,
+        "calibrated_multiplier": calibrated_multiplier,
+        "effective_multiplier": effective_multiplier,
+        "source_detail": detail,
+        "n_samples": n_samples,
+        "is_event_day": is_event,
+        "event_labels": labels,
+        "target_percentile": EM_MULTIPLIER_TARGET_PERCENTILE,
+        "lookback_days": EM_MULTIPLIER_LOOKBACK_DAYS,
+        "vol_window": EM_MULTIPLIER_VOL_WINDOW,
+        "min_samples": EM_MULTIPLIER_MIN_SAMPLES,
+    })
+
+    short_put_target = spot - effective_multiplier * em
+    short_call_target = spot + effective_multiplier * em
     long_put_target = short_put_target - WING_FRACTION * em
     long_call_target = short_call_target + WING_FRACTION * em
 
@@ -405,19 +502,37 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
     risk_budget = compute_risk_budget(trade_client)
     max_affordable_qty = math.floor(risk_budget / risk_per_contract)
     if max_affordable_qty < 1:
-        raise RuntimeError(
+        log.warning(
             f"Even 1 contract's risk (${risk_per_contract:.2f}) exceeds the risk budget "
-            f"(${risk_budget:.2f}) -- aborting. Raise MAX_RISK_PER_TRADE_USD/MAX_RISK_PER_TRADE_PCT, or "
-            "check whether EM_MULTIPLIER/WING_FRACTION are producing wider wings than intended."
+            f"(${risk_budget:.2f}) -- skipping entry today, no order submitted. This usually just means "
+            "a low-IV day produced a tight condor whose risk/contract happens to exceed budget; if you "
+            "want to trade through days like this, raise MAX_RISK_PER_TRADE_USD/MAX_RISK_PER_TRADE_PCT. "
+            "(If this fires often, also check whether EM_MULTIPLIER/WING_FRACTION are producing wider "
+            "wings than intended.)"
         )
+        return None
 
     qty = min(QTY, max_affordable_qty)
     max_risk = risk_per_contract * qty
 
+    # INFORMATIONAL ONLY (see STOP_LOSS_PCT_INFO above) -- shows how much smaller the
+    # realized loss would be if the stop-loss fires cleanly at its configured threshold,
+    # versus the max-theoretical-loss figure qty is actually sized against. Does not
+    # affect qty/max_risk above in any way.
+    stop_loss_risk_per_contract = STOP_LOSS_PCT_INFO * net_credit * 100
+    stop_loss_implied_risk = stop_loss_risk_per_contract * qty
+    utilization_pct = (stop_loss_risk_per_contract / risk_per_contract) if risk_per_contract else 0.0
+
     log.info(
-        f"Net credit (mid): {net_credit:.2f}/contract | Risk/contract: ${risk_per_contract:.2f} | "
+        f"Net credit (mid): {net_credit:.2f}/contract | Risk/contract (max loss, used for sizing): ${risk_per_contract:.2f} | "
         f"Max affordable qty: {max_affordable_qty} (budget ${risk_budget:.2f}) | QTY cap: {QTY} | "
         f"Using qty={qty} | Max risk: ${max_risk:.2f}"
+    )
+    log.info(
+        f"[sizing info] If the stop-loss fires cleanly at its configured {STOP_LOSS_PCT_INFO:.0%} threshold: "
+        f"${stop_loss_risk_per_contract:.2f}/contract (${stop_loss_implied_risk:.2f} at qty={qty}) -- "
+        f"{utilization_pct:.1%} of the max-loss figure this trade is sized against. The rest is safety "
+        f"margin for scenarios where the stop can't fire cleanly (see README)."
     )
 
     return {
@@ -433,6 +548,38 @@ def build_iron_condor(trade_client, option_data_client, stock_data_client, targe
         "risk_budget": risk_budget,
         "qty": qty,
     }
+
+
+def log_multiplier_decision(decision):
+    """Appends one row per build_iron_condor() invocation to logs/em_multiplier_log.csv --
+    kept SEPARATE from trades.csv (whose schema is fixed/append-only) so this can be
+    reviewed and extended freely. Written unconditionally (not just on days that actually
+    trade), including --dry-run, --test-iv, and days skipped for insufficient risk budget,
+    so you can see what the calibration would have said on every day you ran the bot, not
+    only the days it actually traded. Join to trades.csv on `date` (0DTE only trades once/
+    day, so date is a safe join key here) to compare the multiplier actually used against
+    what was submitted."""
+    LOG_DIR.mkdir(exist_ok=True)
+    is_new = not EM_MULTIPLIER_LOG_CSV.exists()
+    with open(EM_MULTIPLIER_LOG_CSV, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow([
+                "date", "timestamp", "mode", "test_iv_mode",
+                "fixed_multiplier", "calibrated_multiplier", "effective_multiplier",
+                "source_detail", "n_samples", "is_event_day", "event_labels",
+                "target_percentile", "lookback_days", "vol_window", "min_samples",
+            ])
+        writer.writerow([
+            decision["date"], decision["timestamp"], decision["mode"], decision["test_iv_mode"],
+            f"{decision['fixed_multiplier']:.4f}",
+            f"{decision['calibrated_multiplier']:.4f}" if decision["calibrated_multiplier"] is not None else "",
+            f"{decision['effective_multiplier']:.4f}",
+            decision["source_detail"], decision["n_samples"], decision["is_event_day"],
+            "|".join(decision["event_labels"]),
+            decision["target_percentile"], decision["lookback_days"],
+            decision["vol_window"], decision["min_samples"],
+        ])
 
 
 def submit_iron_condor(trade_client, plan):
@@ -523,6 +670,8 @@ def main():
         trade_client, option_data_client, stock_data_client,
         target_date=target_date, test_iv=args.test_iv,
     )
+    if plan is None:
+        return  # already logged why (e.g. risk budget can't afford even 1 contract today)
 
     if args.dry_run:
         log.info("--dry-run set: not submitting order.")
